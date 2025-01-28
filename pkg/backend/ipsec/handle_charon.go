@@ -17,6 +17,7 @@
 package ipsec
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -27,9 +28,8 @@ import (
 	"time"
 
 	"github.com/bronze1man/goStrongswanVici"
-	"github.com/flannel-io/flannel/pkg/subnet"
-	"golang.org/x/net/context"
-	log "k8s.io/klog"
+	"github.com/flannel-io/flannel/pkg/lease"
+	log "k8s.io/klog/v2"
 )
 
 type Uri struct {
@@ -147,7 +147,7 @@ func (charon *CharonIKEDaemon) LoadSharedKey(remotePublicIP, password string) er
 	return nil
 }
 
-func (charon *CharonIKEDaemon) LoadConnection(localLease, remoteLease *subnet.Lease,
+func (charon *CharonIKEDaemon) LoadConnection(localLease, remoteLease *lease.Lease,
 	reqID, encap string) error {
 	var err error
 	var client *goStrongswanVici.ClientConn
@@ -210,7 +210,7 @@ func (charon *CharonIKEDaemon) LoadConnection(localLease, remoteLease *subnet.Le
 }
 
 func (charon *CharonIKEDaemon) UnloadCharonConnection(localLease,
-	remoteLease *subnet.Lease) error {
+	remoteLease *lease.Lease) error {
 	client, err := charon.getClient(false)
 	if err != nil {
 		log.Errorf("Failed to acquire Vici client: %s", err)
@@ -232,12 +232,12 @@ func (charon *CharonIKEDaemon) UnloadCharonConnection(localLease,
 	return nil
 }
 
-func formatConnectionName(localLease, remoteLease *subnet.Lease) string {
+func formatConnectionName(localLease, remoteLease *lease.Lease) string {
 	return fmt.Sprintf("%s-%s-%s-%s", localLease.Attrs.PublicIP,
 		localLease.Subnet, remoteLease.Subnet, remoteLease.Attrs.PublicIP)
 }
 
-func formatChildSAConfName(localLease, remoteLease *subnet.Lease) string {
+func formatChildSAConfName(localLease, remoteLease *lease.Lease) string {
 	return fmt.Sprintf("%s-%s", localLease.Subnet, remoteLease.Subnet)
 }
 

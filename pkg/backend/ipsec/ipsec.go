@@ -17,16 +17,16 @@
 package ipsec
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
 
-	"golang.org/x/net/context"
-
 	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
+	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/subnet"
-	log "k8s.io/klog"
+	log "k8s.io/klog/v2"
 )
 
 /*
@@ -94,7 +94,7 @@ func (be *IPSECBackend) RegisterNetwork(
 
 	log.Infof("IPSec config: UDPEncap=%v ESPProposal=%s", cfg.UDPEncap, cfg.ESPProposal)
 
-	attrs := subnet.LeaseAttrs{
+	attrs := lease.LeaseAttrs{
 		PublicIP:    ip.FromIP(be.extIface.ExtAddr),
 		BackendType: "ipsec",
 	}

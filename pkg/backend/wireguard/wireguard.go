@@ -17,6 +17,7 @@
 package wireguard
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -25,8 +26,8 @@ import (
 
 	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
+	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/subnet"
-	"golang.org/x/net/context"
 )
 
 type Mode string
@@ -56,7 +57,7 @@ func New(sm subnet.Manager, extIface *backend.ExternalInterface) (backend.Backen
 	return be, nil
 }
 
-func newSubnetAttrs(publicIP net.IP, publicIPv6 net.IP, enableIPv4, enableIPv6 bool, publicKey string) (*subnet.LeaseAttrs, error) {
+func newSubnetAttrs(publicIP net.IP, publicIPv6 net.IP, enableIPv4, enableIPv6 bool, publicKey string) (*lease.LeaseAttrs, error) {
 	data, err := json.Marshal(&wireguardLeaseAttrs{
 		PublicKey: publicKey,
 	})
@@ -64,7 +65,7 @@ func newSubnetAttrs(publicIP net.IP, publicIPv6 net.IP, enableIPv4, enableIPv6 b
 		return nil, err
 	}
 
-	leaseAttrs := &subnet.LeaseAttrs{
+	leaseAttrs := &lease.LeaseAttrs{
 		BackendType: "wireguard",
 	}
 
@@ -106,12 +107,14 @@ func (be *WireguardBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGr
 	cfg := struct {
 		ListenPort                  int
 		ListenPortV6                int
+		MTU                         int
 		PSK                         string
 		PersistentKeepaliveInterval time.Duration
 		Mode                        Mode
 	}{
 		ListenPort:                  51820,
 		ListenPortV6:                51821,
+		MTU:                         be.extIface.Iface.MTU,
 		PersistentKeepaliveInterval: 0,
 		Mode:                        Separate,
 	}
@@ -129,21 +132,21 @@ func (be *WireguardBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGr
 	var publicKey string
 	if cfg.Mode == Separate {
 		if config.EnableIPv4 {
-			dev, err = createWGDev(ctx, wg, "flannel-wg", cfg.PSK, &keepalive, cfg.ListenPort, be.extIface.Iface.MTU)
+			dev, err = createWGDev(ctx, wg, "flannel-wg", cfg.PSK, &keepalive, cfg.ListenPort, cfg.MTU)
 			if err != nil {
 				return nil, err
 			}
 			publicKey = dev.attrs.publicKey.String()
 		}
 		if config.EnableIPv6 {
-			v6Dev, err = createWGDev(ctx, wg, "flannel-wg-v6", cfg.PSK, &keepalive, cfg.ListenPortV6, be.extIface.Iface.MTU)
+			v6Dev, err = createWGDev(ctx, wg, "flannel-wg-v6", cfg.PSK, &keepalive, cfg.ListenPortV6, cfg.MTU)
 			if err != nil {
 				return nil, err
 			}
 			publicKey = v6Dev.attrs.publicKey.String()
 		}
 	} else if cfg.Mode == Auto || cfg.Mode == Ipv4 || cfg.Mode == Ipv6 {
-		dev, err = createWGDev(ctx, wg, "flannel-wg", cfg.PSK, &keepalive, cfg.ListenPort, be.extIface.Iface.MTU)
+		dev, err = createWGDev(ctx, wg, "flannel-wg", cfg.PSK, &keepalive, cfg.ListenPort, cfg.MTU)
 		if err != nil {
 			return nil, err
 		}
@@ -168,30 +171,30 @@ func (be *WireguardBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGr
 	}
 
 	if config.EnableIPv4 {
-		net, err := config.GetFlannelNetwork(&lease.Subnet)
-		if err != nil {
-			return nil, err
+		if lease.Subnet.Empty() {
+			return nil, fmt.Errorf("failed to configure wg interface: IPv4 is enabled but the lease has no IPv4")
 		}
-		err = dev.Configure(lease.Subnet.IP, net)
+
+		err = dev.Configure(lease.Subnet.IP, config.Network)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	if config.EnableIPv6 {
-		ipv6net, err := config.GetFlannelIPv6Network(&lease.IPv6Subnet)
-		if err != nil {
-			return nil, err
+		if lease.IPv6Subnet.Empty() {
+			return nil, fmt.Errorf("failed to configure wg interface: IPv6 is enabled but the lease has no IPv6")
 		}
+
 		if cfg.Mode == Separate {
-			err = v6Dev.ConfigureV6(lease.IPv6Subnet.IP, ipv6net)
+			err = v6Dev.ConfigureV6(lease.IPv6Subnet.IP, config.IPv6Network)
 		} else {
-			err = dev.ConfigureV6(lease.IPv6Subnet.IP, ipv6net)
+			err = dev.ConfigureV6(lease.IPv6Subnet.IP, config.IPv6Network)
 		}
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return newNetwork(be.sm, be.extIface, dev, v6Dev, cfg.Mode, lease)
+	return newNetwork(be.sm, be.extIface, dev, v6Dev, cfg.Mode, lease, cfg.MTU)
 }

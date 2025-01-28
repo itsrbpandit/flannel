@@ -15,16 +15,17 @@
 package backend
 
 import (
-	"github.com/flannel-io/flannel/pkg/subnet"
-	"golang.org/x/net/context"
+	"context"
+
+	"github.com/flannel-io/flannel/pkg/lease"
 )
 
 type SimpleNetwork struct {
-	SubnetLease *subnet.Lease
+	SubnetLease *lease.Lease
 	ExtIface    *ExternalInterface
 }
 
-func (n *SimpleNetwork) Lease() *subnet.Lease {
+func (n *SimpleNetwork) Lease() *lease.Lease {
 	return n.SubnetLease
 }
 

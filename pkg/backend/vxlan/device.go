@@ -26,17 +26,19 @@ import (
 	"github.com/flannel-io/flannel/pkg/ip"
 	"github.com/flannel-io/flannel/pkg/mac"
 	"github.com/vishvananda/netlink"
-	log "k8s.io/klog"
+	log "k8s.io/klog/v2"
 )
 
 type vxlanDeviceAttrs struct {
 	vni       uint32
 	name      string
+	MTU       int
 	vtepIndex int
 	vtepAddr  net.IP
 	vtepPort  int
 	gbp       bool
 	learning  bool
+	hwAddr    net.HardwareAddr
 }
 
 type vxlanDevice struct {
@@ -45,15 +47,20 @@ type vxlanDevice struct {
 }
 
 func newVXLANDevice(devAttrs *vxlanDeviceAttrs) (*vxlanDevice, error) {
-	hardwareAddr, err := mac.NewHardwareAddr()
-	if err != nil {
-		return nil, err
+	var err error
+	hardwareAddr := devAttrs.hwAddr
+	if devAttrs.hwAddr == nil {
+		hardwareAddr, err = mac.NewHardwareAddr()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	link := &netlink.Vxlan{
 		LinkAttrs: netlink.LinkAttrs{
 			Name:         devAttrs.name,
 			HardwareAddr: hardwareAddr,
+			MTU:          devAttrs.MTU - 50,
 		},
 		VxlanId:      int(devAttrs.vni),
 		VtepDevIndex: devAttrs.vtepIndex,
@@ -128,6 +135,17 @@ func (dev *vxlanDevice) Configure(ipa ip.IP4Net, flannelnet ip.IP4Net) error {
 		return fmt.Errorf("failed to set interface %s to UP state: %s", dev.link.Attrs().Name, err)
 	}
 
+	// ensure vxlan device hadware mac
+	// See https://github.com/flannel-io/flannel/issues/1795
+	nLink, err := netlink.LinkByName(dev.link.LinkAttrs.Name)
+	if err == nil {
+		if vxlan, ok := nLink.(*netlink.Vxlan); ok {
+			if vxlan.Attrs().HardwareAddr.String() != dev.MACAddr().String() {
+				return fmt.Errorf("%s's mac address wanted: %s, but got: %v", dev.link.Name, dev.MACAddr().String(), vxlan.HardwareAddr)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -138,6 +156,17 @@ func (dev *vxlanDevice) ConfigureIPv6(ipn ip.IP6Net, flannelnet ip.IP6Net) error
 
 	if err := netlink.LinkSetUp(dev.link); err != nil {
 		return fmt.Errorf("failed to set v6 interface %s to UP state: %w", dev.link.Attrs().Name, err)
+	}
+
+	// ensure vxlan device hadware mac
+	// See https://github.com/flannel-io/flannel/issues/1795
+	nLink, err := netlink.LinkByName(dev.link.LinkAttrs.Name)
+	if err == nil {
+		if vxlan, ok := nLink.(*netlink.Vxlan); ok {
+			if vxlan.Attrs().HardwareAddr.String() != dev.MACAddr().String() {
+				return fmt.Errorf("%s's v6 mac address wanted: %s, but got: %v", dev.link.Name, dev.MACAddr().String(), vxlan.HardwareAddr)
+			}
+		}
 	}
 
 	return nil

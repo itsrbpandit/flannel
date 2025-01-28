@@ -23,9 +23,10 @@ import (
 	"os/exec"
 	"regexp"
 	"strconv"
+	"sync"
 
 	"github.com/coreos/go-iptables/iptables"
-	log "k8s.io/klog"
+	log "k8s.io/klog/v2"
 )
 
 const (
@@ -46,6 +47,10 @@ type ipTablesRestore struct {
 	path    string
 	proto   iptables.Protocol
 	hasWait bool
+	// ipTablesRestore needs a mutex to ensure that two avoid
+	// collisions between two goroutines calling ApplyWithoutFlush in parallel.
+	// This could result in the second call accidentally restoring a rule removed by the first
+	mu sync.Mutex
 }
 
 // IPTablesRestoreRules represents iptables-restore table block
@@ -75,12 +80,15 @@ func NewIPTablesRestoreWithProtocol(protocol iptables.Protocol) (IPTablesRestore
 		path:    path,
 		proto:   protocol,
 		hasWait: hasWait,
+		mu:      sync.Mutex{},
 	}
 	return &ipt, nil
 }
 
 // ApplyWithoutFlush apply without flush chains
 func (iptr *ipTablesRestore) ApplyWithoutFlush(rules IPTablesRestoreRules) error {
+	iptr.mu.Lock()
+	defer iptr.mu.Unlock()
 	payload := buildIPTablesRestorePayload(rules)
 
 	log.V(6).Infof("trying to run with payload %s", payload)
@@ -106,7 +114,7 @@ func (iptr *ipTablesRestore) runWithOutput(args []string, stdin io.Reader) (stri
 	cmd.Stdin = stdin
 
 	if err := cmd.Run(); err != nil {
-		return "", "", err
+		return stdout.String(), stderr.String(), err
 	}
 
 	return stdout.String(), stderr.String(), nil

@@ -15,13 +15,16 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,20 +32,20 @@ import (
 	"time"
 
 	"github.com/coreos/pkg/flagutil"
-	"github.com/flannel-io/flannel/pkg/iptables"
 	"github.com/flannel-io/flannel/pkg/ip"
 	"github.com/flannel-io/flannel/pkg/ipmatch"
 	"github.com/flannel-io/flannel/pkg/subnet"
 	etcd "github.com/flannel-io/flannel/pkg/subnet/etcd"
 	"github.com/flannel-io/flannel/pkg/subnet/kube"
+	"github.com/flannel-io/flannel/pkg/trafficmngr"
+	"github.com/flannel-io/flannel/pkg/trafficmngr/iptables"
+	"github.com/flannel-io/flannel/pkg/trafficmngr/nftables"
 	"github.com/flannel-io/flannel/pkg/version"
-	"golang.org/x/net/context"
-	log "k8s.io/klog"
-
 	"github.com/joho/godotenv"
+	log "k8s.io/klog/v2"
 
 	// Backends need to be imported for their init() to get executed and them to register
-	"github.com/coreos/go-systemd/daemon"
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/flannel-io/flannel/pkg/backend"
 	_ "github.com/flannel-io/flannel/pkg/backend/alloc"
 	_ "github.com/flannel-io/flannel/pkg/backend/extension"
@@ -93,7 +96,6 @@ type CmdLineOpts struct {
 	iptablesForwardRules      bool
 	netConfPath               string
 	setNodeNetworkUnavailable bool
-	useMultiClusterCidr       bool
 }
 
 var (
@@ -130,7 +132,6 @@ func init() {
 	flannelFlags.BoolVar(&opts.iptablesForwardRules, "iptables-forward-rules", true, "add default accept rules to FORWARD chain in iptables")
 	flannelFlags.StringVar(&opts.netConfPath, "net-config-path", "/etc/kube-flannel/net-conf.json", "path to the network configuration file")
 	flannelFlags.BoolVar(&opts.setNodeNetworkUnavailable, "set-node-network-unavailable", true, "set NodeNetworkUnavailable after ready")
-	flannelFlags.BoolVar(&opts.useMultiClusterCidr, "use-multi-cluster-cidr", false, "use MultiClusterCIDR API (alpha)")
 
 	log.InitFlags(nil)
 
@@ -175,8 +176,7 @@ func newSubnetManager(ctx context.Context) (subnet.Manager, error) {
 			opts.kubeConfigFile,
 			opts.kubeAnnotationPrefix,
 			opts.netConfPath,
-			opts.setNodeNetworkUnavailable,
-			opts.useMultiClusterCidr)
+			opts.setNodeNetworkUnavailable)
 	}
 
 	cfg := &etcd.EtcdConfig{
@@ -261,8 +261,33 @@ func main() {
 		os.Exit(1)
 	}
 
+	if runtime.GOOS != "windows" {
+		// From Kubernetes 1.30 kubeadm doesn't check if the br_netfilter module is loaded and in case it's missing Flannel wrongly starts
+		if config.EnableIPv4 {
+			if _, err = os.Stat("/proc/sys/net/bridge/bridge-nf-call-iptables"); os.IsNotExist(err) {
+				log.Error("Failed to check br_netfilter: ", err)
+				os.Exit(1)
+			}
+		}
+		if config.EnableIPv6 {
+			if _, err = os.Stat("/proc/sys/net/bridge/bridge-nf-call-ip6tables"); os.IsNotExist(err) {
+				log.Error("Failed to check br_netfilter: ", err)
+				os.Exit(1)
+			}
+		}
+	}
+
 	// Work out which interface to use
 	var extIface *backend.ExternalInterface
+
+	annotatedPublicIP, annotatedPublicIPv6 := sm.GetStoredPublicIP(ctx)
+	if annotatedPublicIP != "" {
+		opts.publicIP = annotatedPublicIP
+	}
+	if annotatedPublicIPv6 != "" {
+		opts.publicIPv6 = annotatedPublicIPv6
+	}
+
 	optsPublicIP := ipmatch.PublicIPOpts{
 		PublicIP:   opts.publicIP,
 		PublicIPv6: opts.publicIPv6,
@@ -337,58 +362,36 @@ func main() {
 		os.Exit(1)
 	}
 
+	//Create TrafficManager and instantiate it based on whether we use iptables or nftables
+	trafficMngr := newTrafficManager(config.EnableNFTables)
+	err = trafficMngr.Init(ctx, &wg)
+	if err != nil {
+		log.Error(err)
+		cancel()
+		wg.Wait()
+		os.Exit(1)
+	}
+
 	// Set up ipMasq if needed
 	if opts.ipMasq {
-		if config.EnableIPv4 {
-			net, err := config.GetFlannelNetwork(&bn.Lease().Subnet)
-			if err != nil {
-				log.Error(err)
-				cancel()
-				wg.Wait()
-				os.Exit(1)
-			}
-			if err = recycleIPTables(net, bn.Lease()); err != nil {
-				log.Errorf("Failed to recycle IPTables rules, %v", err)
-				cancel()
-				wg.Wait()
-				os.Exit(1)
-			}
-			log.Infof("Setting up masking rules")
-			iptables.CreateIP4Chain("nat", "FLANNEL-POSTRTG")
-			getRules := func() []iptables.IPTablesRule {
-				if config.HasNetworks() {
-					return iptables.MasqRules(config.Networks, bn.Lease())
-				} else {
-					return iptables.MasqRules([]ip.IP4Net{config.Network}, bn.Lease())
-				}
-			}
-			go iptables.SetupAndEnsureIP4Tables(getRules, opts.iptablesResyncSeconds)
+		prevNetwork := ReadCIDRFromSubnetFile(opts.subnetFile, "FLANNEL_NETWORK")
+		prevSubnet := ReadCIDRFromSubnetFile(opts.subnetFile, "FLANNEL_SUBNET")
 
-		}
-		if config.EnableIPv6 {
-			ip6net, err := config.GetFlannelIPv6Network(&bn.Lease().IPv6Subnet)
-			if err != nil {
-				log.Error(err)
-				cancel()
-				wg.Wait()
-				os.Exit(1)
-			}
-			if err = recycleIP6Tables(ip6net, bn.Lease()); err != nil {
-				log.Errorf("Failed to recycle IP6Tables rules, %v", err)
-				cancel()
-				wg.Wait()
-				os.Exit(1)
-			}
-			log.Infof("Setting up masking ip6 rules")
-			iptables.CreateIP6Chain("nat", "FLANNEL-POSTRTG")
-			getRules := func() []iptables.IPTablesRule {
-				if config.HasIPv6Networks() {
-					return iptables.MasqIP6Rules(config.IPv6Networks, bn.Lease())
-				} else {
-					return iptables.MasqIP6Rules([]ip.IP6Net{config.IPv6Network}, bn.Lease())
-				}
-			}
-			go iptables.SetupAndEnsureIP6Tables(getRules, opts.iptablesResyncSeconds)
+		prevIPv6Network := ReadIP6CIDRFromSubnetFile(opts.subnetFile, "FLANNEL_IPV6_NETWORK")
+		prevIPv6Subnet := ReadIP6CIDRFromSubnetFile(opts.subnetFile, "FLANNEL_IPV6_SUBNET")
+
+		err = trafficMngr.SetupAndEnsureMasqRules(ctx,
+			config.Network, prevSubnet,
+			prevNetwork,
+			config.IPv6Network, prevIPv6Subnet,
+			prevIPv6Network,
+			bn.Lease(),
+			opts.iptablesResyncSeconds)
+		if err != nil {
+			log.Errorf("Failed to setup masq rules, %v", err)
+			cancel()
+			wg.Wait()
+			os.Exit(1)
 		}
 	}
 
@@ -396,36 +399,10 @@ func main() {
 	// In Docker 1.12 and earlier, the default FORWARD chain policy was ACCEPT.
 	// In Docker 1.13 and later, Docker sets the default policy of the FORWARD chain to DROP.
 	if opts.iptablesForwardRules {
-		if config.EnableIPv4 {
-			net, err := config.GetFlannelNetwork(&bn.Lease().Subnet)
-			if err != nil {
-				log.Error(err)
-				cancel()
-				wg.Wait()
-				os.Exit(1)
-			}
-			log.Infof("Changing default FORWARD chain policy to ACCEPT")
-			iptables.CreateIP4Chain("filter", "FLANNEL-FWD")
-			getRules := func() []iptables.IPTablesRule {
-				return iptables.ForwardRules(net.String())
-			}
-			go iptables.SetupAndEnsureIP4Tables(getRules, opts.iptablesResyncSeconds)
-		}
-		if config.EnableIPv6 {
-			ip6net, err := config.GetFlannelIPv6Network(&bn.Lease().IPv6Subnet)
-			if err != nil {
-				log.Error(err)
-				cancel()
-				wg.Wait()
-				os.Exit(1)
-			}
-			log.Infof("IPv6: Changing default FORWARD chain policy to ACCEPT")
-			iptables.CreateIP6Chain("filter", "FLANNEL-FWD")
-			getRules := func() []iptables.IPTablesRule {
-				return iptables.ForwardRules(ip6net.String())
-			}
-			go iptables.SetupAndEnsureIP6Tables(getRules, opts.iptablesResyncSeconds)
-		}
+		trafficMngr.SetupAndEnsureForwardRules(ctx,
+			config.Network,
+			config.IPv6Network,
+			opts.iptablesResyncSeconds)
 	}
 
 	if err := sm.HandleSubnetFile(opts.subnetFile, config, opts.ipMasq, bn.Lease().Subnet, bn.Lease().IPv6Subnet, bn.MTU()); err != nil {
@@ -462,57 +439,6 @@ func main() {
 	wg.Wait()
 	log.Info("Exiting cleanly...")
 	os.Exit(0)
-}
-
-func recycleIPTables(nw ip.IP4Net, lease *subnet.Lease) error {
-	prevNetworks := ReadCIDRsFromSubnetFile(opts.subnetFile, "FLANNEL_NETWORK")
-	prevSubnet := ReadCIDRFromSubnetFile(opts.subnetFile, "FLANNEL_SUBNET")
-
-	//Find the cidr in FLANNEL_NETWORK which contains the podCIDR (i.e. FLANNEL_SUBNET) of this node
-	prevNetwork := ip.IP4Net{}
-	for _, net := range prevNetworks {
-		if net.ContainsCIDR(&prevSubnet) {
-			prevNetwork = net
-			break
-		}
-	}
-	// recycle iptables rules only when network configured or subnet leased is not equal to current one.
-	if prevNetwork != nw && prevSubnet != lease.Subnet {
-		log.Infof("Current network or subnet (%v, %v) is not equal to previous one (%v, %v), trying to recycle old iptables rules", nw, lease.Subnet, prevNetwork, prevSubnet)
-		lease := &subnet.Lease{
-			Subnet: prevSubnet,
-		}
-		if err := iptables.DeleteIP4Tables(iptables.MasqRules(prevNetworks, lease)); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func recycleIP6Tables(nw ip.IP6Net, lease *subnet.Lease) error {
-	prevNetworks := ReadIP6CIDRsFromSubnetFile(opts.subnetFile, "FLANNEL_IPV6_NETWORK")
-	prevSubnet := ReadIP6CIDRFromSubnetFile(opts.subnetFile, "FLANNEL_IPV6_SUBNET")
-
-	//Find the cidr in FLANNEL_IPV6_NETWORK which contains the podCIDR (i.e. FLANNEL_IPV6_SUBNET) of this node
-	prevNetwork := ip.IP6Net{}
-	for _, net := range prevNetworks {
-		if net.ContainsCIDR(&prevSubnet) {
-			prevNetwork = net
-			break
-		}
-	}
-
-	// recycle iptables rules only when network configured or subnet leased is not equal to current one.
-	if prevNetwork.String() != nw.String() && prevSubnet.String() != lease.IPv6Subnet.String() {
-		log.Infof("Current ipv6 network or subnet (%v, %v) is not equal to previous one (%v, %v), trying to recycle old ip6tables rules", nw, lease.IPv6Subnet, prevNetwork, prevSubnet)
-		lease := &subnet.Lease{
-			IPv6Subnet: prevSubnet,
-		}
-		if err := iptables.DeleteIP6Tables(iptables.MasqIP6Rules(prevNetworks, lease)); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func shutdownHandler(ctx context.Context, sigs chan os.Signal, cancel context.CancelFunc) {
@@ -581,7 +507,8 @@ func mustRunHealthz(stopChan <-chan struct{}, wg *sync.WaitGroup) {
 		<-stopChan
 
 		// create new context with timeout for http server to shutdown gracefully
-		ctx, _ := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
 			log.Errorf("Shutdown healthz server error. %v", err)
 		}
@@ -593,10 +520,10 @@ func ReadCIDRFromSubnetFile(path string, CIDRKey string) ip.IP4Net {
 	prevCIDRs := ReadCIDRsFromSubnetFile(path, CIDRKey)
 	if len(prevCIDRs) == 0 {
 		log.Warningf("no subnet found for key: %s in file: %s", CIDRKey, path)
-		return ip.IP4Net{}
+		return ip.IP4Net{IP: 0, PrefixLen: 0}
 	} else if len(prevCIDRs) > 1 {
 		log.Errorf("error reading subnet: more than 1 entry found for key: %s in file %s: ", CIDRKey, path)
-		return ip.IP4Net{}
+		return ip.IP4Net{IP: 0, PrefixLen: 0}
 	} else {
 		return prevCIDRs[0]
 	}
@@ -628,10 +555,10 @@ func ReadIP6CIDRFromSubnetFile(path string, CIDRKey string) ip.IP6Net {
 	prevCIDRs := ReadIP6CIDRsFromSubnetFile(path, CIDRKey)
 	if len(prevCIDRs) == 0 {
 		log.Warningf("no subnet found for key: %s in file: %s", CIDRKey, path)
-		return ip.IP6Net{}
+		return ip.IP6Net{IP: (*ip.IP6)(big.NewInt(0)), PrefixLen: 0}
 	} else if len(prevCIDRs) > 1 {
 		log.Errorf("error reading subnet: more than 1 entry found for key: %s in file %s: ", CIDRKey, path)
-		return ip.IP6Net{}
+		return ip.IP6Net{IP: (*ip.IP6)(big.NewInt(0)), PrefixLen: 0}
 	} else {
 		return prevCIDRs[0]
 	}
@@ -657,4 +584,12 @@ func ReadIP6CIDRsFromSubnetFile(path string, CIDRKey string) []ip.IP6Net {
 		}
 	}
 	return prevCIDRs
+}
+
+func newTrafficManager(useNftables bool) trafficmngr.TrafficManager {
+	if useNftables {
+		return &nftables.NFTablesManager{}
+	} else {
+		return &iptables.IPTablesManager{}
+	}
 }

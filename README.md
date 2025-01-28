@@ -32,36 +32,66 @@ Though not required, it's recommended that flannel uses the Kubernetes API as it
 Flannel can be added to any existing Kubernetes cluster though it's simplest to add `flannel` before any pods using the pod network have been started.
 
 For Kubernetes v1.17+
-```
+
+#### Deploying Flannel with kubectl
+
+```bash
 kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
 ```
 
 If you use custom `podCIDR` (not `10.244.0.0/16`) you first need to download the above manifest and modify the network to match your one.
 
+#### Deploying Flannel with helm
+
+```bash
+# Needs manual creation of namespace to avoid helm error
+kubectl create ns kube-flannel
+kubectl label --overwrite ns kube-flannel pod-security.kubernetes.io/enforce=privileged
+
+helm repo add flannel https://flannel-io.github.io/flannel/
+helm install flannel --set podCidr="10.244.0.0/16" --namespace kube-flannel flannel/flannel
+```
+
 See [Kubernetes](Documentation/kubernetes.md) for more details.
 
 In case a firewall is configured ensure to enable the right port used by the configured [backend][backends].
+
+Flannel uses `portmap` as CNI network plugin by default; when deploying Flannel ensure that the [CNI Network plugins][Network-plugins] are installed in `/opt/cni/bin` the latest binaries can be downloaded with the following commands:
+
+```bash
+ARCH=$(uname -m)
+  case $ARCH in
+    armv7*) ARCH="arm";;
+    aarch64) ARCH="arm64";;
+    x86_64) ARCH="amd64";;
+  esac
+mkdir -p /opt/cni/bin
+curl -O -L https://github.com/containernetworking/plugins/releases/download/v1.6.0/cni-plugins-linux-$ARCH-v1.6.0.tgz
+tar -C /opt/cni/bin -xzf cni-plugins-linux-$ARCH-v1.6.0.tgz
+```
+
+Flannel requires the br_netfilter module to start and from version 1.30 kubeadm doesn't check if the module is installed and Flannel will not rightly start in case the module is missing.
 
 ## Getting started on Docker
 
 flannel is also widely used outside of kubernetes. When deployed outside of kubernetes, etcd is always used as the datastore. For more details integrating flannel with Docker see [Running](Documentation/running.md)
 
 ## Documentation
+
 - [Building (and releasing)](Documentation/building.md)
 - [Configuration](Documentation/configuration.md)
 - [Backends](Documentation/backends.md)
 - [Running](Documentation/running.md)
 - [Troubleshooting](Documentation/troubleshooting.md)
 - [Projects integrating with flannel](Documentation/integrations.md)
-- [Production users](Documentation/production-users.md)
 
 ## Contact
 
-* Slack: 
-   * #k3s on [Rancher Users Slack](https://slack.rancher.io)
-   * #flannel-users on [Calico Users Slack](https://slack.projectcalico.org)
-* Planning/Roadmap: [milestones][milestones], [roadmap][roadmap]
-* Bugs: [issues][flannel-issues]
+- Slack:
+  - #k3s on [Rancher Users Slack](https://slack.rancher.io)
+  - #flannel-users on [Calico Users Slack](https://slack.projectcalico.org)
+- Planning/Roadmap: [milestones][milestones], [roadmap][roadmap]
+- Bugs: [issues][flannel-issues]
 
 ## Community Meeting
 
@@ -82,7 +112,6 @@ See [reporting bugs][reporting] for details about reporting any issues.
 Flannel is under the Apache 2.0 license. See the [LICENSE][license] file for details.
 
 [calico]: http://www.projectcalico.org
-[pod-cidr]: https://kubernetes.io/docs/admin/kubelet/
 [etcd]: https://go.etcd.io/etcd/v3
 [contributing]: CONTRIBUTING.md
 [license]: https://github.com/flannel-io/flannel/blob/master/LICENSE
@@ -92,5 +121,5 @@ Flannel is under the Apache 2.0 license. See the [LICENSE][license] file for det
 [roadmap]: https://github.com/kubernetes/kubernetes/milestones
 [reporting]: Documentation/reporting_bugs.md
 [k3s-installer]: https://github.com/k3s-io/k3s/#quick-start---install-script
-[installing-with-kubeadm]: https://kubernetes.io/docs/getting-started-guides/kubeadm/
 [k3s]: https://k3s.io/
+[Network-plugins]: https://github.com/containernetworking/plugins

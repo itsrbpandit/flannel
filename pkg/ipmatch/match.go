@@ -19,11 +19,12 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"runtime"
 	"strings"
 
 	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
-	log "k8s.io/klog"
+	log "k8s.io/klog/v2"
 )
 
 const (
@@ -82,6 +83,7 @@ func LookupExtIface(ifname string, ifregexS string, ifcanreach string, ipStack i
 				if err != nil {
 					return nil, fmt.Errorf("error looking up v6 interface %s: %s", ifname, err)
 				}
+				ifaceV6Addr = ifaceAddr
 			case dualStack:
 				if ifaceAddr.To4() != nil {
 					iface, err = ip.GetInterfaceByIP(ifaceAddr)
@@ -198,6 +200,9 @@ func LookupExtIface(ifname string, ifregexS string, ifcanreach string, ipStack i
 			return nil, fmt.Errorf("Could not match pattern %s to any of the available network interfaces (%s)", ifregexS, strings.Join(availableFaces, ", "))
 		}
 	} else if len(ifcanreach) > 0 {
+		if runtime.GOOS == "windows" {
+			return nil, fmt.Errorf("ifcanreach is not supported on windows")
+		}
 		log.Info("Determining interface to use based on given ifcanreach: ", ifcanreach)
 		if iface, ifaceAddr, err = ip.GetInterfaceBySpecificIPRouting(net.ParseIP(ifcanreach)); err != nil {
 			return nil, fmt.Errorf("failed to get ifcanreach based interface: %s", err)

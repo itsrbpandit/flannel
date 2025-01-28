@@ -17,6 +17,7 @@
 package wireguard
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -24,9 +25,9 @@ import (
 
 	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
+	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/subnet"
-	"golang.org/x/net/context"
-	log "k8s.io/klog"
+	log "k8s.io/klog/v2"
 )
 
 const (
@@ -47,11 +48,12 @@ type network struct {
 	v6Dev    *wgDevice
 	extIface *backend.ExternalInterface
 	mode     Mode
-	lease    *subnet.Lease
+	lease    *lease.Lease
 	sm       subnet.Manager
+	mtu      int
 }
 
-func newNetwork(sm subnet.Manager, extIface *backend.ExternalInterface, dev, v6Dev *wgDevice, mode Mode, lease *subnet.Lease) (*network, error) {
+func newNetwork(sm subnet.Manager, extIface *backend.ExternalInterface, dev, v6Dev *wgDevice, mode Mode, lease *lease.Lease, mtu int) (*network, error) {
 	n := &network{
 		dev:      dev,
 		v6Dev:    v6Dev,
@@ -59,24 +61,25 @@ func newNetwork(sm subnet.Manager, extIface *backend.ExternalInterface, dev, v6D
 		mode:     mode,
 		lease:    lease,
 		sm:       sm,
+		mtu:      mtu,
 	}
 
 	return n, nil
 }
 
-func (n *network) Lease() *subnet.Lease {
+func (n *network) Lease() *lease.Lease {
 	return n.lease
 }
 
 func (n *network) MTU() int {
-	return n.extIface.Iface.MTU - overhead
+	return n.mtu - overhead
 }
 
 func (n *network) Run(ctx context.Context) {
 	wg := sync.WaitGroup{}
 
 	log.Info("Watching for new subnet leases")
-	events := make(chan []subnet.Event)
+	events := make(chan []lease.Event)
 	wg.Add(1)
 	go func() {
 		subnet.WatchLeases(ctx, n.sm, n.lease, events)
@@ -132,10 +135,10 @@ func (n *network) selectPublicEndpoint(ip4 *ip.IP4, ip6 *ip.IP6) string {
 	return ip4.String()
 }
 
-func (n *network) handleSubnetEvents(ctx context.Context, batch []subnet.Event) {
+func (n *network) handleSubnetEvents(ctx context.Context, batch []lease.Event) {
 	for _, event := range batch {
 		switch event.Type {
-		case subnet.EventAdded:
+		case lease.EventAdded:
 
 			if event.Lease.Attrs.BackendType != "wireguard" {
 				log.Warningf("Ignoring non-wireguard subnet: type=%v", event.Lease.Attrs.BackendType)
@@ -180,13 +183,9 @@ func (n *network) handleSubnetEvents(ctx context.Context, batch []subnet.Event) 
 					if err != nil {
 						log.Errorf("could not read network config: %v", err)
 					}
-					flannelnet, err := netconf.GetFlannelNetwork(&event.Lease.Subnet)
-					if err != nil {
-						log.Errorf("could not get flannel network: %v", err)
-					}
 
-					if err := n.dev.addRoute(flannelnet.ToIPNet()); err != nil {
-						log.Errorf("failed to add ipv4 route to (%s): %v", flannelnet, err)
+					if err := n.dev.addRoute(netconf.Network.ToIPNet()); err != nil {
+						log.Errorf("failed to add ipv4 route to (%s): %v", netconf.Network, err)
 					}
 				}
 
@@ -203,13 +202,9 @@ func (n *network) handleSubnetEvents(ctx context.Context, batch []subnet.Event) 
 					if err != nil {
 						log.Errorf("could not read network config: %v", err)
 					}
-					ipv6flannelnet, err := netconf.GetFlannelIPv6Network(&event.Lease.IPv6Subnet)
-					if err != nil {
-						log.Errorf("could not get flannel network: %v", err)
-					}
 
-					if err := n.v6Dev.addRoute(ipv6flannelnet.ToIPNet()); err != nil {
-						log.Errorf("failed to add ipv6 route to (%s): %v", ipv6flannelnet, err)
+					if err := n.v6Dev.addRoute(netconf.IPv6Network.ToIPNet()); err != nil {
+						log.Errorf("failed to add ipv6 route to (%s): %v", netconf.IPv6Network, err)
 					}
 				}
 			} else {
@@ -239,25 +234,17 @@ func (n *network) handleSubnetEvents(ctx context.Context, batch []subnet.Event) 
 				if err != nil {
 					log.Errorf("could not read network config: %v", err)
 				}
-				flannelnet, err := netconf.GetFlannelNetwork(&event.Lease.Subnet)
-				if err != nil {
-					log.Errorf("could not get flannel network: %v", err)
+
+				if err := n.dev.addRoute(netconf.Network.ToIPNet()); err != nil {
+					log.Errorf("failed to add ipv4 route to (%s): %v", netconf.Network, err)
 				}
 
-				if err := n.dev.addRoute(flannelnet.ToIPNet()); err != nil {
-					log.Errorf("failed to add ipv4 route to (%s): %v", flannelnet, err)
-				}
-				ipv6flannelnet, err := netconf.GetFlannelIPv6Network(&event.Lease.IPv6Subnet)
-				if err != nil {
-					log.Errorf("could not get flannel network: %v", err)
-				}
-
-				if err := n.dev.addRoute(ipv6flannelnet.ToIPNet()); err != nil {
-					log.Errorf("failed to add ipv6 route to (%s): %v", ipv6flannelnet, err)
+				if err := n.dev.addRoute(netconf.IPv6Network.ToIPNet()); err != nil {
+					log.Errorf("failed to add ipv6 route to (%s): %v", netconf.IPv6Network, err)
 				}
 			}
 
-		case subnet.EventRemoved:
+		case lease.EventRemoved:
 
 			if event.Lease.Attrs.BackendType != "wireguard" {
 				log.Warningf("Ignoring non-wireguard subnet: type=%v", event.Lease.Attrs.BackendType)

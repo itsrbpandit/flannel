@@ -17,14 +17,15 @@
 package udp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
 
 	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
+	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/subnet"
-	"golang.org/x/net/context"
 )
 
 func init() {
@@ -63,7 +64,7 @@ func (be *UdpBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGroup, c
 	}
 
 	// Acquire the lease form subnet manager
-	attrs := subnet.LeaseAttrs{
+	attrs := lease.LeaseAttrs{
 		PublicIP: ip.FromIP(be.extIface.ExtAddr),
 	}
 
@@ -78,15 +79,11 @@ func (be *UdpBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGroup, c
 		return nil, fmt.Errorf("failed to acquire lease: %v", err)
 	}
 
-	net, err := config.GetFlannelNetwork(&l.Subnet)
-	if err != nil {
-		return nil, err
-	}
 	// Tunnel's subnet is that of the whole overlay network (e.g. /16)
 	// and not that of the individual host (e.g. /24)
 	tunNet := ip.IP4Net{
 		IP:        l.Subnet.IP,
-		PrefixLen: net.PrefixLen,
+		PrefixLen: config.Network.PrefixLen,
 	}
 
 	return newNetwork(be.sm, be.extIface, cfg.Port, tunNet, l)

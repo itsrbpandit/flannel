@@ -19,30 +19,32 @@ If you want to cross-compile for a different platform (e.g. you're running `amd6
 Then you should be able to set the ARCH as above
 * ARCH=arm make image
 
+## Building a multi-arch image
+
+To build the multi-arch image of flannel locally, you need to install [Docker buildx](https://github.com/docker/buildx).
+Then you can use the following target:
+```
+make build-multi-arch
+```
+
+If you don't already have a builder running locally, you can this target to start it:
+```
+make buildx-create-builder
+```
+
+See the [buildx documentation](https://docs.docker.com/reference/cli/docker/buildx/) for more details.
+
+## Running the tests locally
+To run the end-to-end tests locally, you need to installl [Docker compose](https://docs.docker.com/compose/install/).
+
 ## Building manually
 
 1. Make sure you have required dependencies installed on your machine.
     * On Ubuntu, run `sudo apt-get install linux-libc-dev golang gcc`. 
-      If the golang version installed is not 1.7 or higher. Download the newest golang and install manully.
+      If the golang version installed is not 1.7 or higher. Download the newest golang and install manually.
       To build the flannel.exe on windows, mingw-w64 is also needed. Run command `sudo apt-get install mingw-w64`
     * On Fedora/Redhat, run `sudo yum install kernel-headers golang gcc glibc-static`.
 2. Git clone the flannel repo. It MUST be placed in your GOPATH under `github.com/flannel-io/flannel`: `cd $GOPATH/src; git clone https://github.com/flannel-io/flannel.git`
 3. Run the build script, ensuring that `CGO_ENABLED=1`: `cd flannel; CGO_ENABLED=1 make dist/flanneld` for linux usage.
    Run the build script, ensuring that `CGO_ENABLED=1`: `cd flannel; CGO_ENABLED=1 make dist/flanneld.exe` for windows usage.
 
-# Release Process
-
-1. Create a release on GitHub and use it to create a tag.
-2. Check the tag out and run
-    * `make release`
-3. Attach all the files in `dist` to the GitHub release.
-4. Run `make docker-push-all` to push all the images to a registry.
-
-# Obtaining master builds
-
-A new build of flannel is created for every commit to master. They can be obtained from [https://hub.docker.com/r/flannel/flannel](https://hub.docker.com/r/flannel/flannel/tags )
-
-* `latest` is always the amd64 build.
-* The image tags have a number of components e.g. `v0.21.2-amd64`
-  * The last release was `v0.21.2`
-  * The platform is `amd64`

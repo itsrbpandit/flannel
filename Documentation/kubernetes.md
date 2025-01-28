@@ -8,7 +8,7 @@ NOTE: If `kubeadm` is used, then pass `--pod-network-cidr=10.244.0.0/16` to `kub
 
 The `flannel` manifest defines five things:
 1. A `kube-flannel` with PodSecurity level set to *privileged*. 
-2. A ClusterRole and ClusterRoleBinding for Role Based Acccess Control (RBAC).
+2. A ClusterRole and ClusterRoleBinding for Role Based Access Control (RBAC).
 3. A service account for `flannel` to use.
 4. A ConfigMap containing both a CNI configuration and a `flannel` configuration. The `network` in the `flannel` configuration should match the pod network CIDR. The choice of `backend` is also made here and defaults to VXLAN.
 5. A DaemonSet for every architecture to deploy the `flannel` pod on each Node. The pod has two containers 1) the `flannel` daemon itself, and 2) an initContainer for deploying the CNI configuration to a location that the `kubelet` can read.
@@ -31,7 +31,10 @@ If you want to deploy `flannel` securely in a shared namespace or want more fine
 Other options include [Kyverno](https://kyverno.io/policies/pod-security/) and [OPA Gatekeeper](https://github.com/open-policy-agent/gatekeeper).
 # Annotations
 
-*  `flannel.alpha.coreos.com/public-ip-overwrite`: Allows to overwrite the public IP of a node. Useful if the public IP can not determined from the node, e.G. because it is behind a NAT. It can be automatically set to a nodes `ExternalIP` using the [flannel-node-annotator](https://github.com/alvaroaleman/flannel-node-annotator)
+Additional annotations can be configured on a specific node as parameters used when Flannel starts on that specific node
+*  `flannel.alpha.coreos.com/node-public-ip`, `flannel.alpha.coreos.com/node-public-ipv6`: Define the used IP of the node in case the node has multiple interface it selects the interface with the configured IP for the backend tunnel. If configured when Flannel starts it'll be used as the `public-ip` and `public-ipv6` flag.
+*  `flannel.alpha.coreos.com/public-ip-overwrite`, `flannel.alpha.coreos.com/public-ipv6-overwrite`: Allows to overwrite the public IP of a node that IP can be not configured on the node. Useful if the public IP can not determined from the node, e.G. because it is behind a NAT and the other nodes need to use it to create the tunnel. It can be automatically set to a nodes `ExternalIP` using the [flannel-node-annotator](https://github.com/alvaroaleman/flannel-node-annotator).
+   See also the "NAT" section in [troubleshooting](./troubleshooting.md) if UDP checksums seem corrupted.
 
 ## Older versions of Kubernetes
 

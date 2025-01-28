@@ -15,20 +15,20 @@
 package extension
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"strings"
-
-	"encoding/json"
 	"os/exec"
+	"strings"
 	"sync"
 
 	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
+	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/subnet"
-	"golang.org/x/net/context"
-	log "k8s.io/klog"
+	log "k8s.io/klog/v2"
 )
 
 func init() {
@@ -95,10 +95,17 @@ func (be *ExtensionBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGr
 		log.Infof("No pre startup command configured - skipping")
 	}
 
-	attrs := subnet.LeaseAttrs{
-		PublicIP:    ip.FromIP(be.extIface.ExtAddr),
+	attrs := lease.LeaseAttrs{
 		BackendType: "extension",
 		BackendData: data,
+	}
+
+	if be.extIface.IfaceAddr != nil {
+		attrs.PublicIP = ip.FromIP(be.extIface.IfaceAddr)
+	}
+
+	if be.extIface.IfaceV6Addr != nil {
+		attrs.PublicIPv6 = ip.FromIP6(be.extIface.IfaceV6Addr)
 	}
 
 	lease, err := be.sm.AcquireLease(ctx, &attrs)
@@ -117,7 +124,9 @@ func (be *ExtensionBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGr
 		cmd_output, err := runCmd([]string{
 			fmt.Sprintf("NETWORK=%s", config.Network),
 			fmt.Sprintf("SUBNET=%s", lease.Subnet),
-			fmt.Sprintf("PUBLIC_IP=%s", attrs.PublicIP)},
+			fmt.Sprintf("IPV6SUBNET=%s", lease.IPv6Subnet),
+			fmt.Sprintf("PUBLIC_IP=%s", attrs.PublicIP),
+			fmt.Sprintf("PUBLIC_IPV6=%s", attrs.PublicIPv6)},
 			"", "sh", "-c", n.postStartupCommand)
 		if err != nil {
 			return nil, fmt.Errorf("failed to run command: %s Err: %v Output: %s", n.postStartupCommand, err, cmd_output)

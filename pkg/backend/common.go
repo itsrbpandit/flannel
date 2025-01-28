@@ -15,11 +15,12 @@
 package backend
 
 import (
+	"context"
 	"net"
 	"sync"
 
+	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/subnet"
-	"golang.org/x/net/context"
 )
 
 type ExternalInterface struct {
@@ -40,7 +41,7 @@ type Backend interface {
 }
 
 type Network interface {
-	Lease() *subnet.Lease
+	Lease() *lease.Lease
 	MTU() int
 	Run(ctx context.Context)
 }
