@@ -15,6 +15,7 @@
 package hostgw
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -23,13 +24,13 @@ import (
 	"github.com/Microsoft/hcsshim"
 	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
+	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/routing"
 	"github.com/flannel-io/flannel/pkg/subnet"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/wait"
-	log "k8s.io/klog"
+	log "k8s.io/klog/v2"
 )
 
 func init() {
@@ -79,16 +80,16 @@ func (be *HostgwBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGroup
 		Mtu:         be.extIface.Iface.MTU,
 		LinkIndex:   be.extIface.Iface.Index,
 	}
-	n.GetRoute = func(lease *subnet.Lease) *routing.Route {
+	n.GetRoute = func(myLease *lease.Lease) *routing.Route {
 		return &routing.Route{
-			DestinationSubnet: lease.Subnet.ToIPNet(),
-			GatewayAddress:    lease.Attrs.PublicIP.ToIP(),
+			DestinationSubnet: myLease.Subnet.ToIPNet(),
+			GatewayAddress:    myLease.Attrs.PublicIP.ToIP(),
 			InterfaceIndex:    n.LinkIndex,
 		}
 	}
 
 	// 2. Acquire the lease form subnet manager
-	attrs := subnet.LeaseAttrs{
+	attrs := lease.LeaseAttrs{
 		PublicIP:    ip.FromIP(be.extIface.ExtAddr),
 		BackendType: "host-gw",
 	}
@@ -160,11 +161,11 @@ func (be *HostgwBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGroup
 		// Wait for the network to populate Management IP
 		log.Infof("Waiting to get ManagementIP from HNSNetwork %s", networkName)
 		var newNetworkID = newNetwork.Id
-		waitErr = wait.Poll(500*time.Millisecond, 30*time.Second, func() (done bool, err error) {
+		waitErr := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 5*time.Second, true, func(context.Context) (done bool, err error) {
 			newNetwork, lastErr = hcsshim.HNSNetworkRequest("GET", newNetworkID, "")
 			return newNetwork != nil && len(newNetwork.ManagementIP) != 0, nil
 		})
-		if waitErr == wait.ErrWaitTimeout {
+		if waitErr != nil {
 			// Do not swallow the root cause
 			if lastErr != nil {
 				waitErr = lastErr
@@ -178,12 +179,11 @@ func (be *HostgwBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGroup
 		if err != nil {
 			return nil, errors.Wrapf(err, "Failed to parse management ip (%s)", newNetwork.ManagementIP)
 		}
-
-		waitErr = wait.Poll(500*time.Millisecond, 5*time.Second, func() (done bool, err error) {
+		waitErr = wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 5*time.Second, true, func(context.Context) (done bool, err error) {
 			_, lastErr = ip.GetInterfaceByIP(managementIP.ToIP())
 			return lastErr == nil, nil
 		})
-		if waitErr == wait.ErrWaitTimeout {
+		if waitErr != nil {
 			return nil, errors.Wrapf(lastErr, "timeout, failed to get net interface for HNSNetwork %s (%s)", networkName, newNetwork.ManagementIP)
 		}
 
@@ -226,7 +226,7 @@ func (be *HostgwBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGroup
 
 	// Wait for the bridgeEndpoint to attach to the host
 	log.Infof("Waiting to attach bridge endpoint %s to host", bridgeEndpointName)
-	waitErr = wait.Poll(500*time.Millisecond, 5*time.Second, func() (done bool, err error) {
+	waitErr = wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 5*time.Second, true, func(context.Context) (done bool, err error) {
 		lastErr = expectedBridgeEndpoint.HostAttach(1)
 		if lastErr == nil {
 			return true, nil
@@ -238,7 +238,7 @@ func (be *HostgwBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGroup
 		}
 		return false, nil
 	})
-	if waitErr == wait.ErrWaitTimeout {
+	if waitErr != nil {
 		return nil, errors.Wrapf(lastErr, "failed to hot attach bridge HNSEndpoint %s to host compartment", bridgeEndpointName)
 	}
 	log.Infof("Attached bridge endpoint %s to host successfully", bridgeEndpointName)

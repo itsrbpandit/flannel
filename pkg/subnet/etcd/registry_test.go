@@ -16,16 +16,16 @@ package etcd
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/flannel-io/flannel/pkg/ip"
-	. "github.com/flannel-io/flannel/pkg/subnet"
+	"github.com/flannel-io/flannel/pkg/lease"
 	etcd "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/tests/v3/integration"
-	"golang.org/x/net/context"
 )
 
 func newTestEtcdRegistry(t *testing.T, ctx context.Context, client *etcd.Client) (Registry, etcd.KV) {
@@ -48,48 +48,52 @@ func newTestEtcdRegistry(t *testing.T, ctx context.Context, client *etcd.Client)
 
 func watchSubnets(t *testing.T, r Registry, ctx context.Context, sn ip.IP4Net, nextIndex int64, result chan error) {
 	type leaseEvent struct {
-		etype  EventType
+		etype  lease.EventType
 		subnet ip.IP4Net
 		found  bool
 	}
 	expectedEvents := []leaseEvent{
-		{EventAdded, sn, false},
-		{EventRemoved, sn, false},
+		{lease.EventAdded, sn, false},
+		{lease.EventRemoved, sn, false},
 	}
 
+	receiver := make(chan []lease.LeaseWatchResult)
 	numFound := 0
-	for {
-		evt, index, err := r.watchSubnets(ctx, nextIndex)
 
-		switch {
-		case err == nil:
-			nextIndex = index
-			for _, exp := range expectedEvents {
-				if evt.Type != exp.etype {
-					continue
-				}
-				if exp.found == true {
-					result <- fmt.Errorf("Subnet event type already found: %v", exp)
-					return
-				}
-				if !evt.Lease.Subnet.Equal(exp.subnet) {
-					result <- fmt.Errorf("Subnet event lease %v mismatch (expected %v)", evt.Lease.Subnet, exp.subnet)
-				}
-				exp.found = true
-				numFound += 1
-			}
-			if numFound == len(expectedEvents) {
-				// All done; success
-				result <- nil
-				return
-			}
-		case isIndexTooSmall(err):
-			nextIndex = nextIndex + 1
-
-		default:
-			result <- fmt.Errorf("Error watching subnet leases: %v", err)
+	go func() {
+		err := r.watchSubnets(ctx, receiver, nextIndex)
+		if err != nil {
+			result <- errNoWatchChannel
 			return
 		}
+	}()
+
+	for watchResults := range receiver {
+		for _, wr := range watchResults {
+			for _, evt := range wr.Events {
+				for _, exp := range expectedEvents {
+					if evt.Type != exp.etype {
+						continue
+					}
+					if exp.found == true {
+						result <- fmt.Errorf("Subnet event type already found: %v", exp)
+						return
+					}
+					if !evt.Lease.Subnet.Equal(exp.subnet) {
+						result <- fmt.Errorf("Subnet event lease %v mismatch (expected %v)", evt.Lease.Subnet, exp.subnet)
+					}
+					exp.found = true
+					numFound += 1
+				}
+				if numFound == len(expectedEvents) {
+					// All done; success
+					result <- nil
+					return
+				}
+			}
+
+		}
+
 	}
 }
 
@@ -101,7 +105,7 @@ func TestEtcdRegistry(t *testing.T) {
 
 	client := clus.RandClient()
 
-	ctx, _ := context.WithCancel(context.Background())
+	ctx := context.Background()
 
 	r, kvApi := newTestEtcdRegistry(t, ctx, client)
 
@@ -144,7 +148,7 @@ func TestEtcdRegistry(t *testing.T) {
 
 	startWg.Wait()
 	// Lease a subnet for the network
-	attrs := &LeaseAttrs{
+	attrs := &lease.LeaseAttrs{
 		PublicIP: ip.MustParseIP4("1.2.3.4"),
 	}
 	exp, err := r.createSubnet(ctx, sn, ip.IP6Net{}, attrs, 24*time.Hour)

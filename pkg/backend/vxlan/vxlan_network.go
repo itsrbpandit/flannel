@@ -17,6 +17,7 @@
 package vxlan
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"sync"
@@ -24,11 +25,11 @@ import (
 
 	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
+	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/retry"
 	"github.com/flannel-io/flannel/pkg/subnet"
 	"github.com/vishvananda/netlink"
-	"golang.org/x/net/context"
-	log "k8s.io/klog"
+	log "k8s.io/klog/v2"
 )
 
 type network struct {
@@ -36,13 +37,14 @@ type network struct {
 	dev       *vxlanDevice
 	v6Dev     *vxlanDevice
 	subnetMgr subnet.Manager
+	mtu       int
 }
 
 const (
 	encapOverhead = 50
 )
 
-func newNetwork(subnetMgr subnet.Manager, extIface *backend.ExternalInterface, dev *vxlanDevice, v6Dev *vxlanDevice, _ ip.IP4Net, lease *subnet.Lease) (*network, error) {
+func newNetwork(subnetMgr subnet.Manager, extIface *backend.ExternalInterface, dev *vxlanDevice, v6Dev *vxlanDevice, _ ip.IP4Net, lease *lease.Lease, mtu int) (*network, error) {
 	nw := &network{
 		SimpleNetwork: backend.SimpleNetwork{
 			SubnetLease: lease,
@@ -51,6 +53,7 @@ func newNetwork(subnetMgr subnet.Manager, extIface *backend.ExternalInterface, d
 		subnetMgr: subnetMgr,
 		dev:       dev,
 		v6Dev:     v6Dev,
+		mtu:       mtu,
 	}
 
 	return nw, nil
@@ -60,7 +63,7 @@ func (nw *network) Run(ctx context.Context) {
 	wg := sync.WaitGroup{}
 
 	log.V(0).Info("watching for new subnet leases")
-	events := make(chan []subnet.Event)
+	events := make(chan []lease.Event)
 	wg.Add(1)
 	go func() {
 		subnet.WatchLeases(ctx, nw.subnetMgr, nw.SubnetLease, events)
@@ -81,19 +84,20 @@ func (nw *network) Run(ctx context.Context) {
 }
 
 func (nw *network) MTU() int {
-	return nw.ExtIface.Iface.MTU - encapOverhead
+	return nw.mtu - encapOverhead
 }
 
 type vxlanLeaseAttrs struct {
-	VNI     uint16
+	VNI     uint32
 	VtepMAC hardwareAddr
 }
 
-func (nw *network) handleSubnetEvents(batch []subnet.Event) {
+func (nw *network) handleSubnetEvents(batch []lease.Event) {
 	for _, event := range batch {
 		sn := event.Lease.Subnet
 		v6Sn := event.Lease.IPv6Subnet
 		attrs := event.Lease.Attrs
+		log.Infof("Received Subnet Event with VxLan: %s", attrs.String())
 		if attrs.BackendType != "vxlan" {
 			log.Warningf("ignoring non-vxlan v4Subnet(%s) v6Subnet(%s): type=%v", sn, v6Sn, attrs.BackendType)
 			continue
@@ -166,7 +170,7 @@ func (nw *network) handleSubnetEvents(batch []subnet.Event) {
 		}
 
 		switch event.Type {
-		case subnet.EventAdded:
+		case lease.EventAdded:
 			if event.Lease.EnableIPv4 {
 				if directRoutingOK {
 					log.V(2).Infof("Adding direct route to subnet: %s PublicIP: %s", sn, attrs.PublicIP)
@@ -277,7 +281,7 @@ func (nw *network) handleSubnetEvents(batch []subnet.Event) {
 					}
 				}
 			}
-		case subnet.EventRemoved:
+		case lease.EventRemoved:
 			if event.Lease.EnableIPv4 {
 				if directRoutingOK {
 					log.V(2).Infof("Removing direct route to subnet: %s PublicIP: %s", sn, attrs.PublicIP)

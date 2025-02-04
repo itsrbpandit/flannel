@@ -17,14 +17,16 @@
 package vxlan
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/Microsoft/hcsshim/hcn"
 	"github.com/flannel-io/flannel/pkg/ip"
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
-	log "k8s.io/klog"
+	log "k8s.io/klog/v2"
 )
 
 type vxlanDeviceAttrs struct {
@@ -32,6 +34,7 @@ type vxlanDeviceAttrs struct {
 	name          string
 	gbp           bool
 	addressPrefix ip.IP4Net
+	interfaceName string
 }
 
 type vxlanDevice struct {
@@ -40,7 +43,11 @@ type vxlanDevice struct {
 	directRouting bool
 }
 
-func newVXLANDevice(devAttrs *vxlanDeviceAttrs) (*vxlanDevice, error) {
+type NetAdapterNameSettings struct {
+	NetworkAdapterName string `json:"NetworkAdapterName"`
+}
+
+func newVXLANDevice(ctx context.Context, devAttrs *vxlanDeviceAttrs) (*vxlanDevice, error) {
 	subnet := createSubnet(devAttrs.addressPrefix.String(), (devAttrs.addressPrefix.IP + 1).String(), "0.0.0.0/0")
 	network := &hcn.HostComputeNetwork{
 		Type: "Overlay",
@@ -80,7 +87,11 @@ func newVXLANDevice(devAttrs *vxlanDeviceAttrs) (*vxlanDevice, error) {
 
 	network.Ipams[0].Subnets[0].Policies = append(network.Ipams[0].Subnets[0].Policies, spJson)
 
-	hnsNetwork, err := ensureNetwork(network, devAttrs.addressPrefix.String())
+	if devAttrs.interfaceName != "" {
+		addNetAdapterName(network, devAttrs.interfaceName)
+	}
+
+	hnsNetwork, err := ensureNetwork(ctx, network, devAttrs.addressPrefix.String())
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +101,7 @@ func newVXLANDevice(devAttrs *vxlanDeviceAttrs) (*vxlanDevice, error) {
 	}, nil
 }
 
-func ensureNetwork(expectedNetwork *hcn.HostComputeNetwork, expectedAddressPrefix string) (*hcn.HostComputeNetwork, error) {
+func ensureNetwork(ctx context.Context, expectedNetwork *hcn.HostComputeNetwork, expectedAddressPrefix string) (*hcn.HostComputeNetwork, error) {
 	createNetwork := true
 	networkName := expectedNetwork.Name
 
@@ -124,11 +135,11 @@ func ensureNetwork(expectedNetwork *hcn.HostComputeNetwork, expectedAddressPrefi
 		// Wait for the network to populate Management IP
 		log.Infof("Waiting to get ManagementIP from HostComputeNetwork %s", networkName)
 		var newNetworkID = newNetwork.Id
-		waitErr = wait.Poll(500*time.Millisecond, 5*time.Second, func() (done bool, err error) {
+		waitErr = wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 5*time.Second, true, func(context.Context) (done bool, err error) {
 			newNetwork, lastErr = hcn.GetNetworkByID(newNetworkID)
 			return newNetwork != nil && len(getManagementIP(newNetwork)) != 0, nil
 		})
-		if waitErr == wait.ErrWaitTimeout {
+		if waitErr != nil {
 			// Do not swallow the root cause
 			if lastErr != nil {
 				waitErr = lastErr
@@ -136,20 +147,9 @@ func ensureNetwork(expectedNetwork *hcn.HostComputeNetwork, expectedAddressPrefi
 			return nil, errors.Wrapf(lastErr, "timeout, failed to get management IP from HostComputeNetwork %s", networkName)
 		}
 
-		managementIP := getManagementIP(newNetwork)
-		// Wait for the interface with the management IP
-		log.Infof("Waiting to get net interface for HostComputeNetwork %s (%s)", networkName, managementIP)
-		managementIPv4, err := ip.ParseIP4(managementIP)
+		err = checkHostNetworkReady(ctx, newNetwork)
 		if err != nil {
-			return nil, errors.Wrapf(err, "Failed to parse management ip (%s)", managementIP)
-		}
-
-		waitErr = wait.Poll(500*time.Millisecond, 5*time.Second, func() (done bool, err error) {
-			_, lastErr = ip.GetInterfaceByIP(managementIPv4.ToIP())
-			return lastErr == nil, nil
-		})
-		if waitErr == wait.ErrWaitTimeout {
-			return nil, errors.Wrapf(lastErr, "timeout, failed to get net interface for HostComputeNetwork %s (%s)", networkName, managementIP)
+			return nil, errors.Wrapf(err, "Interface bound to %s took too long to get ready. Please check your network host configuration", networkName)
 		}
 
 		log.Infof("Created HostComputeNetwork %s", networkName)
@@ -204,4 +204,50 @@ func createSubnet(AddressPrefix string, NextHop string, DestPrefix string) *hcn.
 			},
 		},
 	}
+}
+
+// addNetAdapterName adds a policy to the network to set the name of the network adapter
+func addNetAdapterName(network *hcn.HostComputeNetwork, netAdapterName string) error {
+	settings := NetAdapterNameSettings{
+		NetworkAdapterName: netAdapterName,
+	}
+
+	settingsJson, err := json.Marshal(settings)
+	if err != nil {
+		return fmt.Errorf("Failed to marshal settings: %w", err)
+	}
+
+	policySettings := hcn.NetworkPolicy{
+		Type:     hcn.NetAdapterName,
+		Settings: settingsJson,
+	}
+
+	network.Policies = append(network.Policies, policySettings)
+
+	return nil
+}
+
+// checkHostNetworkReady waits for the host network to be ready: the main interface must be up and have an IP address
+func checkHostNetworkReady(ctx context.Context, network *hcn.HostComputeNetwork) error {
+	managementIP := getManagementIP(network)
+	// Wait for the interface with the management IP
+	log.Infof("Waiting to get net interface for HostComputeNetwork %s (%s)", network.Name, managementIP)
+	managementIPv4, err := ip.ParseIP4(managementIP)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to parse management ip (%s)", managementIP)
+	}
+
+	waitErr := wait.PollUntilContextTimeout(ctx, 5*time.Second, 45*time.Second, true, func(context.Context) (done bool, err error) {
+		iface, lastErr := ip.GetInterfaceByIP(managementIPv4.ToIP())
+		if lastErr == nil {
+			log.Infof("Host interface: %s bound by %s ready", iface.Name, network.Name)
+			return true, nil
+		}
+		log.V(2).Infof("Host interface bound by %s not ready", network.Name)
+		return false, nil
+	})
+	if waitErr != nil {
+		return errors.Wrapf(waitErr, "timeout, failed to get net interface for HostComputeNetwork %s (%s)", network.Name, managementIP)
+	}
+	return nil
 }
